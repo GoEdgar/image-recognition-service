@@ -127,3 +127,16 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# JetBrains
+.idea
+
+# Serverless directories
+.serverless
+
+# Node
+node_modules
+package-lock.json
+package.json
+
+.DS_Store

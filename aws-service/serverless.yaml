@@ -1,0 +1,190 @@
+service: aws-service
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: python3.9
+  region: eu-west-1
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - 'rekognition:*'
+          Resource: '*'
+        - Effect: Allow
+          Action:
+            - 's3:*'
+          Resource: '*' # !!!!!!!!
+        - Effect: Allow
+          Action:
+            - 'dynamodb:PutItem'
+            - 'dynamodb:UpdateItem'
+          Resource: !GetAtt blobDynamoTable.Arn
+  layers:
+    - Ref: PythonRequirementsLambdaLayer
+  apiGateway:
+    description: Some description
+
+custom:
+  pythonRequirements:
+    layer: true
+
+package:
+  patterns:
+    - '!node_modules/**'
+
+functions:
+  createBlob:
+    handler: lambdas.create_blob.lambda_handler
+    events:
+      - http: 'POST /blobs'
+    environment:
+      BLOB_BUCKET_NAME:
+        Ref: blobBucket
+      BLOB_TABLE_NAME:
+        Ref: blobDynamoTable
+      BUCKET_PUT_OBJECT_ROLE: !GetAtt putBlobToBucketRole.Arn
+
+  processBlob:
+    handler: lambdas.process_blob.lambda_handler
+    events:
+      - s3:
+          bucket: !Ref blobBucket
+          event: s3:ObjectCreated:*
+          existing: true
+    environment:
+      BLOB_TABLE_NAME:
+        Ref: blobDynamoTable
+
+  makeCallback:
+    handler: lambdas.make_callback.lambda_handler
+    events:
+      - stream:
+          type: dynamodb
+          arn: !GetAtt blobDynamoTable.StreamArn
+          batchSize: 1
+          filterPatterns:
+            - eventName: [MODIFY]
+              dynamodb:
+                NewImage:
+                  Labels:
+                    S:
+                      - exists: True
+
+
+resources:
+  Resources:
+    blobBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: blob-bucket-storage
+
+    blobDynamoTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: "BlobId"
+            AttributeType: "S"
+        KeySchema:
+          - AttributeName: "BlobId"
+            KeyType: "HASH"
+        ProvisionedThroughput:
+          ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        TableName: "blobTable"
+        StreamSpecification:
+          StreamViewType: "NEW_AND_OLD_IMAGES"
+
+    putBlobToBucketRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                AWS:
+                  - !GetAtt IamRoleLambdaExecution.Arn
+              Action:
+                - 'sts:AssumeRole'
+        Policies:
+          - PolicyName: root
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 's3:PutObject'
+                  Resource: '*'  # !!!!!
+
+    APIGatewayGetRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - apigateway.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Policies:
+          - PolicyName: APIPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - "dynamodb:GetItem"
+                  Resource: !GetAtt blobDynamoTable.Arn
+
+    getBlobResource:
+      Type: 'AWS::ApiGateway::Resource'
+      Properties:
+        RestApiId: !Ref ApiGatewayRestApi
+        ParentId: !Ref ApiGatewayResourceBlobs
+        PathPart: '{blobId}'
+
+    getBlobDynamoDBIntegration:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        HttpMethod: 'GET'
+        RestApiId: !Ref ApiGatewayRestApi
+        ResourceId: !Ref getBlobResource
+        AuthorizationType: NONE
+        Integration:
+          Type: AWS
+          IntegrationHttpMethod: 'POST'
+          Credentials: !GetAtt APIGatewayGetRole.Arn
+          Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:dynamodb:action/GetItem'
+          PassthroughBehavior: WHEN_NO_TEMPLATES
+          RequestTemplates:
+            application/json: !Sub |
+              {
+                "TableName": "blobTable",
+                "Key": {
+                  "BlobId": {"S": "$input.params('blobId')"}
+                }
+              }
+          IntegrationResponses:
+            - StatusCode: '200'
+              ResponseTemplates:
+                application/json: !Sub |
+                  #set($blob = $input.path('$').Item)
+                  #if($input.path('$').size() == 0)
+                  #set($context.responseOverride.status = 404)
+                  {}
+                  #else
+                  {
+                    "blob_id": "$blob.BlobId.S",
+                    "labels": $blob.Labels.S
+                  }
+                  #end
+        MethodResponses:
+          - StatusCode: '200'
+
+plugins:
+  - serverless-python-requirements
